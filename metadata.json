@@ -1,0 +1,5 @@
+{
+  "name": "PodTool Tracker",
+  "description": "A refined interface for tracking tools, software, and platforms mentioned across your favorite YouTube podcasts, featuring a global leaderboard and episode-specific insights.",
+  "requestFramePermissions": []
+}
