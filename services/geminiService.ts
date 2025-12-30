@@ -1,6 +1,30 @@
 
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { ExtractionResult } from "../types";
+
+const MAX_RETRIES = 3;
+const INITIAL_DELAY = 2000;
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Utility to wrap Gemini API calls with exponential backoff retry logic.
+ */
+async function withRetry<T>(fn: () => Promise<T>, retries = MAX_RETRIES, ms = INITIAL_DELAY): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: any) {
+    const isRateLimit = error?.message?.includes('429') || error?.status === 429 || error?.error?.code === 429;
+    const isServerError = error?.message?.includes('500') || error?.status === 500 || error?.error?.code === 500;
+
+    if ((isRateLimit || isServerError) && retries > 0) {
+      console.warn(`Gemini API error (${error?.status || 'rate limit'}). Retrying in ${ms}ms... (${retries} attempts left)`);
+      await delay(ms);
+      return withRetry(fn, retries - 1, ms * 2);
+    }
+    throw error;
+  }
+}
 
 /**
  * Searches for tools mentioned in a specific YouTube episode using Google Search grounding.
@@ -11,7 +35,8 @@ export const searchForEpisodeTools = async (youtubeUrl: string): Promise<Extract
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   // Step 1: Search using Google Search (Grounding)
-  const searchResponse = await ai.models.generateContent({
+  // Fix: Explicitly type withRetry as returning GenerateContentResponse to avoid 'unknown' type error on line 75
+  const searchResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
     model: "gemini-3-flash-preview",
     contents: `Using Google Search, find details for this YouTube video: ${youtubeUrl}.
     I need:
@@ -32,10 +57,11 @@ export const searchForEpisodeTools = async (youtubeUrl: string): Promise<Extract
     config: {
       tools: [{ googleSearch: {} }],
     }
-  });
+  }));
 
   // Step 2: Structure the search results into a specific JSON schema
-  const extractionResponse = await ai.models.generateContent({
+  // Fix: Explicitly type withRetry as returning GenerateContentResponse to avoid 'unknown' type error on line 116
+  const extractionResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
     model: "gemini-3-flash-preview",
     contents: `Convert these search findings into a structured JSON object.
     
@@ -87,7 +113,8 @@ export const searchForEpisodeTools = async (youtubeUrl: string): Promise<Extract
         required: ["episodes"]
       }
     }
-  });
+  }));
 
+  // Fix: Access .text directly as a property
   return JSON.parse(extractionResponse.text || '{"episodes": []}');
 };
