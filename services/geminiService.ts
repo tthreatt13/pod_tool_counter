@@ -2,10 +2,17 @@
 import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { ExtractionResult } from "../types";
 
-const MAX_RETRIES = 3;
-const INITIAL_DELAY = 2000;
+const MAX_RETRIES = 2; // Reduced from 3 to prevent extreme total wait times
+const INITIAL_DELAY = 1500;
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Strips markdown code blocks from a string if present.
+ */
+function cleanJsonResponse(text: string): string {
+  return text.replace(/^```json\n?/, '').replace(/\n?```$/, '').trim();
+}
 
 /**
  * Utility to wrap Gemini API calls with exponential backoff retry logic.
@@ -18,7 +25,7 @@ async function withRetry<T>(fn: () => Promise<T>, retries = MAX_RETRIES, ms = IN
     const isServerError = error?.message?.includes('500') || error?.status === 500 || error?.error?.code === 500;
 
     if ((isRateLimit || isServerError) && retries > 0) {
-      console.warn(`Gemini API error (${error?.status || 'rate limit'}). Retrying in ${ms}ms... (${retries} attempts left)`);
+      console.warn(`Gemini API ${error?.status || 'Error'}. Retrying in ${ms}ms...`);
       await delay(ms);
       return withRetry(fn, retries - 1, ms * 2);
     }
@@ -27,56 +34,48 @@ async function withRetry<T>(fn: () => Promise<T>, retries = MAX_RETRIES, ms = IN
 }
 
 /**
- * Searches for tools mentioned in a specific YouTube episode using Google Search grounding.
- * Optimized for high fidelity: gets correct channel name, title, thumbnail, and upload date.
- * Features strict filtering to only include software tools and apps, excluding sponsors.
+ * Extracts tools from a YouTube video URL.
+ * Uses a two-step process: Search Grounding (metadata) -> Structuring (JSON).
  */
 export const searchForEpisodeTools = async (youtubeUrl: string): Promise<ExtractionResult> => {
+  // Fresh instance to ensure latest API keys are used
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
-  // Step 1: Search using Google Search (Grounding)
-  // Fix: Explicitly type withRetry as returning GenerateContentResponse to avoid 'unknown' type error on line 75
+  // Step 1: Search grounding to get metadata and find the "Tools referenced" section
   const searchResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
     model: "gemini-3-flash-preview",
-    contents: `Using Google Search, find details for this YouTube video: ${youtubeUrl}.
-    I need:
-    1. The exact video title.
-    2. The official Channel Name (e.g., "How I AI", "Lenny's Podcast").
-    3. The exact upload date in YYYY-MM-DD format.
-    4. A list of all software tools, AI models, developer platforms, or productivity apps mentioned. 
+    contents: `Find specific details for this YouTube video: ${youtubeUrl}.
+    Identify: Official Title, Channel Name, Upload Date (YYYY-MM-DD), and specifically look for a "Tools referenced" or "Links" section in the description.
     
-    Look specifically in sections like "Tools referenced".
+    EXCLUDE: Sponsors, advertisers (like Brex, Mercury), non-software items (books, films, organizations).
+    INCLUDE: Software, AI tools, apps, platforms.
     
-    CRITICAL EXCLUSION RULES:
-    - DO NOT extract Sponsors or Advertisers. Ignore sections starting with "Brought to you by" or "Sponsors". (e.g., skip things like Brex, Mercury, etc. if they are sponsors).
-    - ONLY extract software tools, AI platforms, and technical apps (e.g., ChatGPT, Claude, Cursor, GitHub, Whisper).
-    - DO NOT extract non-software references like documentaries, films, books, historical figures, organizations, or museums (e.g., Ken Burns, PBS, Library of Congress).
-    - IGNORE sections like "Other references" or "Suggested watching" if they contain non-software items.
-    
-    5. The YouTube Video ID from the URL.`,
+    Output a bulleted list of tools and their URLs only. Be concise.`,
     config: {
       tools: [{ googleSearch: {} }],
     }
   }));
 
-  // Step 2: Structure the search results into a specific JSON schema
-  // Fix: Explicitly type withRetry as returning GenerateContentResponse to avoid 'unknown' type error on line 116
+  const searchContent = searchResponse.text || "";
+  
+  // Extract search grounding URLs as per rules
+  const groundingLinks = searchResponse.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+  const groundingInfo = JSON.stringify(groundingLinks);
+
+  // Step 2: Structure the findings into clean JSON
   const extractionResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
     model: "gemini-3-flash-preview",
-    contents: `Convert these search findings into a structured JSON object.
+    contents: `Convert the following findings into a structured JSON object. 
     
-    FILTERING INSTRUCTIONS:
-    - Review the list of items found.
-    - KEEP items that are: AI Models, SaaS products, Mobile Apps, Developer Tools, or Software Platforms mentioned as referenced tools.
-    - REMOVE/IGNORE items identified as Sponsors (e.g., Brex, Mercury, etc. from "Brought to you by" sections).
-    - REMOVE items that are: Documentaries, Movies, Books, People, General Organizations, or Historical Events.
-    - For kept software items, provide the official URL and a 1-sentence description.
-    - Construct the thumbnailUrl using: https://img.youtube.com/vi/[VIDEO_ID]/maxresdefault.jpg
-    
-    Search findings:
-    ${searchResponse.text}
-    
-    Video URL: ${youtubeUrl}`,
+    Search Summary: ${searchContent}
+    Grounding Context: ${groundingInfo}
+    Original URL: ${youtubeUrl}
+
+    REQUIREMENTS:
+    1. Extract tools, URLs, and a 1-sentence description.
+    2. Construct the thumbnailUrl using: https://img.youtube.com/vi/[VIDEO_ID]/maxresdefault.jpg
+    3. Categorize each tool (e.g., AI Model, Dev Tool, Productivity).
+    4. Ensure NO sponsors are included.`,
     config: {
       responseMimeType: "application/json",
       responseSchema: {
@@ -91,7 +90,7 @@ export const searchForEpisodeTools = async (youtubeUrl: string): Promise<Extract
                 podcastName: { type: Type.STRING },
                 youtubeUrl: { type: Type.STRING },
                 thumbnailUrl: { type: Type.STRING },
-                uploadDate: { type: Type.STRING, description: "YYYY-MM-DD format" },
+                uploadDate: { type: Type.STRING },
                 tools: {
                   type: Type.ARRAY,
                   items: {
@@ -115,6 +114,11 @@ export const searchForEpisodeTools = async (youtubeUrl: string): Promise<Extract
     }
   }));
 
-  // Fix: Access .text directly as a property
-  return JSON.parse(extractionResponse.text || '{"episodes": []}');
+  const rawJson = extractionResponse.text || '{"episodes": []}';
+  try {
+    return JSON.parse(cleanJsonResponse(rawJson));
+  } catch (e) {
+    console.error("Failed to parse Gemini JSON output", rawJson);
+    return { episodes: [] };
+  }
 };
